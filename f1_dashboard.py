@@ -1,23 +1,24 @@
 """
-VER33 F1 Prediction Dashboard
-Single-file Flask app. Run: python f1_dashboard.py
+MAX 33 · F1 2026 Oracle
+Run: python f1_dashboard.py
 Visit: http://localhost:5000
 
-Features:
-- Fetches 2022–2025 historical data + 2026 completed races
-- Parallel requests (fast), local cache (no re-downloading)
-- Predictions for every remaining 2026 race
-- Championship Monte Carlo simulation
-- Refresh button updates everything
+Project structure:
+  f1_dashboard.py            ← this file (Flask app + ML logic)
+  f1_weather_competitors.py  ← race date lookup for weather
+  templates/index.html       ← HTML template
+  static/style.css           ← styles
+  static/app.js              ← frontend JS
+  f1_cache/                  ← auto-created cache directory
 """
 
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template, jsonify
 import pandas as pd
 import numpy as np
 import requests
 import json
 import time
-import os
+import pickle
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
@@ -69,6 +70,7 @@ CIRCUIT_COORDS = {
     "rodriguez": (19.40, -99.09), "interlagos": (-23.70, -46.70), "vegas": (36.11, -115.17),
     "yas_marina": (24.47, 54.60), "red_bull_ring": (47.22, 14.76), "shanghai": (31.34, 121.22),
 }
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA FETCHING — parallel + cached
@@ -178,7 +180,6 @@ def collect_all_data():
                "sergio_perez", "lando_norris", "george_russell", "carlos_sainz"]
     YEARS = [2022, 2023, 2024, 2025, 2026]
 
-    # Parallel race results
     tasks = [(d, y) for d in DRIVERS for y in YEARS]
     all_rows = []
     with ThreadPoolExecutor(max_workers=20) as ex:
@@ -189,7 +190,6 @@ def collect_all_data():
     results_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     print(f"  {len(results_df)} race result rows")
 
-    # Parallel quali (only VER, 5 years)
     quali_rows = []
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = [ex.submit(fetch_quali_season, (y,)) for y in YEARS]
@@ -198,16 +198,14 @@ def collect_all_data():
     quali_df = pd.DataFrame(quali_rows) if quali_rows else pd.DataFrame()
     print(f"  {len(quali_df)} quali rows")
 
-    # Weather — load from cache only (populated by background thread)
     wx_df = _load_weather_from_cache()
-
     return results_df, quali_df, pd.DataFrame(), wx_df
 
 
 def _load_weather_from_cache() -> pd.DataFrame:
     """Load whatever weather is already cached — never blocks on network."""
     try:
-        from f1_weather_dates import RACE_DATES_ALL
+        from f1_weather_competitors import RACE_DATES_ALL
     except ImportError:
         return pd.DataFrame()
     rows = []
@@ -227,7 +225,7 @@ def prefetch_weather_background():
     import threading
     def _run():
         try:
-            from f1_weather_dates import RACE_DATES_ALL
+            from f1_weather_competitors import RACE_DATES_ALL
         except ImportError:
             return
         missing = [(c, d) for k, d in RACE_DATES_ALL.items()
@@ -241,6 +239,10 @@ def prefetch_weather_background():
         print("  [bg] Weather cache populated.")
     threading.Thread(target=_run, daemon=True).start()
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FEATURE ENGINEERING
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def build_features(results_df, quali_df, wx_df):
     ver = results_df[results_df["driver_id"] == "max_verstappen"].copy()
@@ -259,17 +261,14 @@ def build_features(results_df, quali_df, wx_df):
     ver["dnf"]    = (ver["status"] != "Finished").astype(float)
     ver["pole"]   = (ver["grid"] == 1).astype(float)
 
-    # ── Recency weight: exponential decay — 2025 counts ~4x more than 2022 ──
     max_year = ver["year"].max()
     ver["recency_w"] = ver["year"].apply(lambda y: 0.55 ** (max_year - y))
 
-    # ── Rolling form: last 5 races globally (across seasons) ──
     ver["roll_win_5"]    = ver["win"].shift(1).rolling(5, min_periods=1).mean()
     ver["roll_pts_5"]    = ver["points"].shift(1).rolling(5, min_periods=1).mean()
     ver["roll_podium_5"] = ver["podium"].shift(1).rolling(5, min_periods=1).mean()
     ver["roll_pos_5"]    = ver["position"].shift(1).rolling(5, min_periods=1).mean()
 
-    # ── Circuit stats — weighted by recency ──
     circ_rows = []
     for cid, g in ver.groupby("circuit_id"):
         w = g["recency_w"]
@@ -285,7 +284,6 @@ def build_features(results_df, quali_df, wx_df):
     circ_df = pd.DataFrame(circ_rows)
     ver = ver.merge(circ_df, on="circuit_id", how="left")
 
-    # Weather merge
     if not wx_df.empty:
         ver = ver.merge(wx_df, on=["year","circuit_id"], how="left")
 
@@ -306,8 +304,8 @@ FEATS_WX = ["temp_max", "precipitation", "wind_speed"]
 def train(df):
     feats = FEATS_BASE + [f for f in FEATS_WX if f in df.columns]
     clean = df.dropna(subset=["position","win"])
-    X   = clean[feats].fillna(clean[feats].median()).fillna(0)
-    w   = clean["recency_w"].fillna(1.0)   # sample weights
+    X     = clean[feats].fillna(clean[feats].median()).fillna(0)
+    w     = clean["recency_w"].fillna(1.0)
     y_pos = clean["position"]
     y_win = clean["win"].astype(int)
     med   = clean[feats].median().fillna(0)
@@ -325,10 +323,8 @@ def train(df):
 
 
 def _circuit_profile(df, circuit_id):
-    """Weighted circuit stats for a specific circuit."""
     hist = df[df["circuit_id"] == circuit_id].copy()
     if hist.empty:
-        # Fall back to overall recent form
         recent = df[df["year"] >= df["year"].max() - 1]
         return {
             "circ_win_rate":    float(recent["win"].mean()),
@@ -351,8 +347,7 @@ def _circuit_profile(df, circuit_id):
 def predict_remaining(df, rf_pos, rf_win, feats, med):
     completed_rounds = set(df[df["year"] == 2026]["round"].tolist()) if not df.empty else set()
 
-    # Recent form: last 5 completed races globally
-    recent5 = df.dropna(subset=["position"]).tail(5)
+    recent5       = df.dropna(subset=["position"]).tail(5)
     roll_win_5    = float(recent5["win"].mean())
     roll_pts_5    = float(recent5["points"].mean())
     roll_podium_5 = float(recent5["podium"].mean())
@@ -363,7 +358,6 @@ def predict_remaining(df, rf_pos, rf_win, feats, med):
         rnd = race["round"]
         cid = race["circuit"]
 
-        # Completed — use actual result
         actual = None
         if rnd in completed_rounds:
             row = df[(df["year"] == 2026) & (df["round"] == rnd)]
@@ -373,7 +367,6 @@ def predict_remaining(df, rf_pos, rf_win, feats, med):
 
         cp = _circuit_profile(df, cid)
 
-        # Quali: use actual if completed, else assume pole (optimistic baseline)
         quali_pos, grid = 1, 1
         if rnd in completed_rounds:
             q_row = df[(df["year"] == 2026) & (df["round"] == rnd)]
@@ -405,11 +398,8 @@ def predict_remaining(df, rf_pos, rf_win, feats, med):
         X_in     = pd.DataFrame([inp])[feats].fillna(med).fillna(0)
         pred_pos = float(rf_pos.predict(X_in)[0])
         win_prob = float(rf_win.predict_proba(X_in)[0][1])
-
-        # Podium prob: model win + weighted circuit podium history
         pod_prob = min(0.98, win_prob + cp["circ_podium_rate"] * 0.6)
 
-        # Update rolling form after each completed race
         if actual is not None:
             pts = {1:25,2:18,3:15,4:12,5:10,6:8,7:6,8:4,9:2,10:1}.get(actual, 0)
             roll_win_5    = roll_win_5    * 0.8 + (1 if actual == 1 else 0) * 0.2
@@ -418,16 +408,16 @@ def predict_remaining(df, rf_pos, rf_win, feats, med):
             roll_pos_5    = roll_pos_5    * 0.8 + actual * 0.2
 
         predictions.append({
-            "round":          rnd,
-            "name":           race["name"],
-            "circuit":        cid,
-            "date":           race["date"],
-            "completed":      rnd in completed_rounds,
-            "actual":         actual,
-            "pred_pos":       round(max(1, pred_pos), 1),
-            "win_prob":       round(win_prob * 100, 1),
-            "podium_prob":    round(pod_prob * 100, 1),
-            "win_rate_hist":  round(cp["circ_win_rate"] * 100, 1),
+            "round":         rnd,
+            "name":          race["name"],
+            "circuit":       cid,
+            "date":          race["date"],
+            "completed":     rnd in completed_rounds,
+            "actual":        actual,
+            "pred_pos":      round(max(1, pred_pos), 1),
+            "win_prob":      round(win_prob * 100, 1),
+            "podium_prob":   round(pod_prob * 100, 1),
+            "win_rate_hist": round(cp["circ_win_rate"] * 100, 1),
         })
 
     return predictions
@@ -450,17 +440,16 @@ def monte_carlo_championship(predictions, n=10000):
             wp  = min(0.95, race["win_prob"]    / 100)
             pp  = min(0.95, race["podium_prob"] / 100) - wp
             pp  = max(0, pp)
-            dnf = race.get("win_rate_hist", 10) / 100 * 0.12   # DNF scales with circuit difficulty
+            dnf = race.get("win_rate_hist", 10) / 100 * 0.12
             dnf = min(0.12, max(0.04, dnf))
             tp  = max(0, 0.85 - wp - pp - dnf)
             out = max(0, 1 - wp - pp - tp - dnf)
             probs = np.array([wp, pp, tp, out, dnf])
             probs /= probs.sum()
-            # Points outcomes: win, podium(avg), top10(avg), outside points, DNF
             outcome = rng.choice([25, 15, 7, 0, 0], p=probs)
             season_pts += outcome
             if outcome >= 10 and rng.random() < 0.22:
-                season_pts += 1  # fastest lap
+                season_pts += 1
         totals.append(season_pts)
 
     totals = np.array(totals)
@@ -477,16 +466,13 @@ def monte_carlo_championship(predictions, n=10000):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GLOBAL STATE — rebuilt on refresh
+# MODEL CACHE
 # ═══════════════════════════════════════════════════════════════════════════════
-
-import pickle
 
 MODEL_PATH     = CACHE_DIR / "model.pkl"
 DATA_HASH_PATH = CACHE_DIR / "data_hash.txt"
 
 def _data_hash(df):
-    """Hash based on number of rows + last race round — changes when new results arrive."""
     return f"{len(df)}_{df['year'].max()}_{df['round'].max() if 'round' in df.columns else 0}"
 
 def save_model(rf_pos, rf_win, feats, med, df):
@@ -497,7 +483,6 @@ def save_model(rf_pos, rf_win, feats, med, df):
     print("  ✓ Model saved to cache")
 
 def load_model(df):
-    """Load cached model if data hasn't changed. Returns None if stale or missing."""
     if not MODEL_PATH.exists() or not DATA_HASH_PATH.exists():
         return None
     with open(DATA_HASH_PATH) as f:
@@ -511,21 +496,23 @@ def load_model(df):
     return m["rf_pos"], m["rf_win"], m["feats"], m["med"]
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# GLOBAL STATE — rebuilt on refresh
+# ═══════════════════════════════════════════════════════════════════════════════
+
 STATE = {"predictions": [], "championship": {}, "last_updated": None, "loading": False, "error": None}
 
 def refresh_data():
     STATE["loading"] = True
-    STATE["error"] = None
+    STATE["error"]   = None
     try:
         print("\n── Refreshing data ──")
-        results_df, quali_df, ver_df, wx_df = collect_all_data()
+        results_df, quali_df, _, wx_df = collect_all_data()
         df = build_features(results_df, quali_df, wx_df)
         if df.empty:
             STATE["error"] = "No data returned from API — check your internet connection."
-            print("  No data available.")
             return
 
-        # Use cached model if data hasn't changed, retrain only when new races appear
         cached = load_model(df)
         if cached:
             rf_pos, rf_win, feats, med = cached
@@ -547,483 +534,12 @@ def refresh_data():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HTML
-# ═══════════════════════════════════════════════════════════════════════════════
-
-HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MAX 33 · 2026 ORACLE</title>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;600&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>
-:root {
-  --orange: #FF5F00;
-  --orange-dim: rgba(255,95,0,.15);
-  --bg: #070b14;
-  --bg2: #0c1220;
-  --bg3: #141c2e;
-  --border: #1c2840;
-  --text: #dde3f0;
-  --muted: #445570;
-  --green: #00ff87;
-  --mono: 'IBM Plex Mono', monospace;
-  --head: 'Bebas Neue', sans-serif;
-  --body: 'DM Sans', sans-serif;
-}
-* { margin:0; padding:0; box-sizing:border-box; }
-html { scroll-behavior: smooth; }
-body { background:var(--bg); color:var(--text); font-family:var(--body); min-height:100vh; }
-
-/* top accent stripe */
-body::before {
-  content:''; position:fixed; top:0; left:0; right:0; height:3px;
-  background: linear-gradient(90deg, var(--orange) 0%, #ff8c00 50%, var(--orange) 100%);
-  z-index:200;
-}
-
-/* ── HEADER ─────────────────────────────────────────── */
-header {
-  display:flex; align-items:stretch; justify-content:space-between;
-  background:var(--bg2); border-bottom:1px solid var(--border);
-  position:sticky; top:3px; z-index:100;
-  overflow:hidden;
-}
-.logo-block { display:flex; align-items:stretch; }
-.logo-number {
-  font-family:var(--head); font-size:54px; line-height:1;
-  background:var(--orange); color:#fff;
-  padding:6px 22px 2px; display:flex; align-items:center;
-  letter-spacing:1px; user-select:none;
-  text-shadow: 2px 2px 0 rgba(0,0,0,.3);
-}
-.logo-text {
-  padding:10px 18px; display:flex; flex-direction:column; justify-content:center; gap:3px;
-}
-.logo-title {
-  font-family:var(--head); font-size:22px; letter-spacing:5px; line-height:1;
-}
-.logo-tagline {
-  font-family:var(--mono); font-size:8px; color:var(--orange);
-  letter-spacing:2.5px; text-transform:uppercase;
-}
-.header-right {
-  display:flex; align-items:center; gap:14px; padding:0 22px;
-}
-.last-updated {
-  font-family:var(--mono); font-size:9px; color:var(--muted); letter-spacing:1px;
-}
-.live-dot {
-  width:7px; height:7px; border-radius:50%;
-  background:var(--green); box-shadow:0 0 7px var(--green);
-  animation:blink 2s infinite;
-}
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
-.refresh-btn {
-  padding:9px 20px;
-  background:transparent; border:1.5px solid var(--orange);
-  color:var(--orange); font-family:var(--head); font-size:16px;
-  letter-spacing:3px; text-transform:uppercase; cursor:pointer;
-  transition:all .2s; white-space:nowrap;
-}
-.refresh-btn:hover {
-  background:var(--orange); color:#fff;
-  box-shadow: 0 0 24px rgba(255,95,0,.3);
-}
-.refresh-btn:disabled { opacity:.35; cursor:wait; }
-
-/* ── MAIN ────────────────────────────────────────────── */
-main {
-  max-width:1320px; margin:0 auto; padding:24px 20px;
-  display:flex; flex-direction:column; gap:18px;
-}
-
-/* ── NEXT RACE SPOTLIGHT ─────────────────────────────── */
-.spotlight {
-  background:var(--bg2); border:1px solid var(--border);
-  border-left:4px solid var(--orange); border-radius:6px;
-  padding:18px 24px;
-  display:grid;
-  grid-template-columns: 1fr auto auto auto;
-  gap:0 40px;
-  align-items:center;
-}
-.sp-label { font-family:var(--mono); font-size:8px; color:var(--orange); letter-spacing:3px; text-transform:uppercase; margin-bottom:4px; }
-.sp-name { font-family:var(--head); font-size:34px; letter-spacing:2px; line-height:1; }
-.sp-meta { font-family:var(--mono); font-size:10px; color:var(--muted); margin-top:3px; }
-.sp-divider { width:1px; height:48px; background:var(--border); }
-.sp-stat { text-align:center; }
-.sp-stat-val { font-family:var(--head); font-size:40px; color:var(--orange); line-height:1; }
-.sp-stat-lbl { font-family:var(--mono); font-size:8px; color:var(--muted); letter-spacing:2px; margin-top:2px; }
-
-/* ── CHAMPIONSHIP BANNER ─────────────────────────────── */
-.champ-grid {
-  display:grid; grid-template-columns:repeat(5,1fr);
-  background:var(--bg2); border:1px solid var(--border); border-radius:6px;
-  overflow:hidden; position:relative;
-}
-/* watermark 33 */
-.champ-grid::after {
-  content:'33'; font-family:var(--head); font-size:220px;
-  color:rgba(255,95,0,.03); position:absolute; right:-8px; top:-30px;
-  line-height:1; pointer-events:none; user-select:none;
-}
-.cm {
-  padding:18px 20px; border-right:1px solid var(--border);
-  position:relative; z-index:1;
-}
-.cm:last-child { border-right:none; }
-.cm-label { font-family:var(--mono); font-size:8px; color:var(--muted); text-transform:uppercase; letter-spacing:2px; margin-bottom:6px; }
-.cm-value { font-family:var(--head); font-size:48px; line-height:1; }
-.cm-value.hi { color:var(--orange); }
-.cm-sub { font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:4px; }
-
-/* ── CHART CARD ──────────────────────────────────────── */
-.chart-card {
-  background:var(--bg2); border:1px solid var(--border); border-radius:6px;
-  padding:18px 22px;
-}
-.card-label {
-  font-family:var(--mono); font-size:8px; color:var(--muted);
-  text-transform:uppercase; letter-spacing:2.5px; margin-bottom:14px;
-  display:flex; align-items:center; gap:10px;
-}
-.card-label::before { content:''; width:14px; height:2px; background:var(--orange); flex-shrink:0; }
-
-/* ── RACE TABLE ──────────────────────────────────────── */
-.races-card {
-  background:var(--bg2); border:1px solid var(--border); border-radius:6px; overflow:hidden;
-}
-.races-header {
-  padding:13px 22px; border-bottom:1px solid var(--border);
-  display:flex; align-items:center; justify-content:space-between;
-}
-table { width:100%; border-collapse:collapse; }
-thead tr { background:var(--bg3); }
-th {
-  font-family:var(--mono); font-size:8px; color:var(--muted);
-  text-transform:uppercase; letter-spacing:1.5px;
-  padding:10px 14px; text-align:left;
-  border-bottom:1px solid var(--border); white-space:nowrap;
-}
-td {
-  padding:11px 14px;
-  border-bottom:1px solid rgba(28,40,64,.5);
-  font-size:13px; vertical-align:middle;
-}
-tr:last-child td { border-bottom:none; }
-tr.done { opacity:.42; }
-tr.nxt td { background:rgba(255,95,0,.05); }
-tr.nxt td:first-child { border-left:3px solid var(--orange); }
-tr:not(.done):not(.nxt):hover td { background:rgba(255,95,0,.025); transition:background .15s; }
-
-.rnd { font-family:var(--mono); font-size:10px; color:var(--muted); }
-.race-nm { font-weight:500; }
-.dt { font-family:var(--mono); font-size:10px; color:var(--muted); white-space:nowrap; }
-.ppos { font-family:var(--head); font-size:24px; line-height:1; }
-.apos { font-family:var(--head); font-size:22px; line-height:1; color:var(--green); }
-
-.barrow { display:flex; align-items:center; gap:8px; }
-.barbg { flex:1; height:4px; background:var(--bg3); border-radius:2px; overflow:hidden; min-width:50px; }
-.barfill { height:100%; border-radius:2px; }
-.barval { font-family:var(--mono); font-size:10px; min-width:34px; text-align:right; }
-
-.badge {
-  font-family:var(--mono); font-size:8px; padding:3px 8px;
-  border-radius:2px; text-transform:uppercase; letter-spacing:1px; white-space:nowrap;
-}
-.b-done { background:rgba(0,255,135,.07); color:var(--green); border:1px solid rgba(0,255,135,.18); }
-.b-next { background:rgba(255,95,0,.1); color:var(--orange); border:1px solid rgba(255,95,0,.28); }
-.b-up   { color:var(--muted); border:1px solid var(--border); }
-
-/* ── FOOTER ──────────────────────────────────────────── */
-footer {
-  text-align:center; padding:20px 16px;
-  font-family:var(--mono); font-size:9px; color:var(--muted); letter-spacing:2px;
-  border-top:1px solid var(--border); margin-top:8px;
-}
-
-/* ── LOADING OVERLAY ─────────────────────────────────── */
-.overlay {
-  position:fixed; inset:0; background:rgba(7,11,20,.92);
-  display:none; flex-direction:column; align-items:center; justify-content:center; gap:20px;
-  z-index:999;
-}
-.spinner {
-  width:44px; height:44px;
-  border:2px solid var(--border); border-top-color:var(--orange);
-  border-radius:50%; animation:spin .7s linear infinite;
-}
-@keyframes spin { to { transform:rotate(360deg); } }
-.load-msg { font-family:var(--mono); font-size:10px; color:var(--muted); letter-spacing:2px; text-transform:uppercase; }
-
-@keyframes fadein { from{opacity:0;transform:translateY(7px)} to{opacity:1;transform:translateY(0)} }
-.anim { animation:fadein .3s ease forwards; }
-
-/* ── RESPONSIVE ──────────────────────────────────────── */
-@media(max-width:960px) {
-  .champ-grid { grid-template-columns:repeat(3,1fr); }
-  .spotlight  { grid-template-columns:1fr 1fr; gap:12px; }
-  .sp-divider { display:none; }
-}
-@media(max-width:640px) {
-  .logo-number { font-size:40px; padding:4px 14px 2px; }
-  .logo-title  { font-size:17px; }
-  .champ-grid  { grid-template-columns:1fr 1fr; }
-  th,td        { padding:8px 10px; }
-  .sp-name     { font-size:24px; }
-}
-</style>
-</head>
-<body>
-
-<div class="overlay" id="overlay">
-  <div class="spinner"></div>
-  <div class="load-msg" id="load-msg">summoning max from the simulator...</div>
-</div>
-
-<header>
-  <div class="logo-block">
-    <div class="logo-number">33</div>
-    <div class="logo-text">
-      <div class="logo-title">MAX VERSTAPPEN · 2026 ORACLE</div>
-      <div class="logo-tagline">VER5TAPPEN TRUTHER &nbsp;·&nbsp; #3 was taken &nbsp;·&nbsp; we don't acknowledge #3</div>
-    </div>
-  </div>
-  <div class="header-right">
-    <div class="last-updated" id="last-updated">—</div>
-    <div class="live-dot"></div>
-    <button class="refresh-btn" id="ref-btn" onclick="doRefresh()">↺ Refresh</button>
-  </div>
-</header>
-
-<main id="main">
-  <div style="text-align:center;padding:80px 20px;font-family:var(--mono);color:var(--muted);font-size:10px;letter-spacing:3px;text-transform:uppercase">
-    hit refresh · the oracle awaits
-  </div>
-</main>
-
-<footer>
-  MAX 33 ORACLE &nbsp;·&nbsp; BUILT FOR THE VERSTAPPEN-PILLED &nbsp;·&nbsp; POWERED BY THE COLLECTIVE DESPAIR OF EVERYONE ELSE ON THE GRID
-</footer>
-
-<script>
-const LOAD_MSGS = [
-  "summoning max from the simulator...",
-  "calculating the inevitable...",
-  "counting laps hamilton couldn't keep up...",
-  "fetching 10,000 parallel timelines...",
-  "asking the model nicely to say p1...",
-  "threatening the api with drs...",
-  "weather check: will it rain? (doesn't matter, max wins anyway)",
-];
-
-let mcChart = null, msgTick = null;
-
-function posColor(pos) {
-  if (pos <= 1) return 'var(--green)';
-  if (pos <= 3) return 'var(--orange)';
-  if (pos <= 6) return 'var(--text)';
-  return 'var(--muted)';
-}
-
-async function doRefresh() {
-  const btn = document.getElementById('ref-btn');
-  const overlay = document.getElementById('overlay');
-  const msgEl = document.getElementById('load-msg');
-  btn.disabled = true; btn.textContent = '... loading';
-  overlay.style.display = 'flex';
-
-  let mi = 0;
-  msgEl.textContent = LOAD_MSGS[0];
-  msgTick = setInterval(() => { mi = (mi+1) % LOAD_MSGS.length; msgEl.textContent = LOAD_MSGS[mi]; }, 2400);
-
-  try {
-    const res  = await fetch('/api/refresh', {method:'POST'});
-    const data = await res.json();
-    clearInterval(msgTick);
-    data.error ? showError(data.error) : render(data);
-  } catch(e) {
-    clearInterval(msgTick);
-    alert('network error: ' + e);
-  }
-
-  btn.disabled = false; btn.textContent = '↺ Refresh';
-  overlay.style.display = 'none';
-}
-
-function showError(err) {
-  document.getElementById('main').innerHTML = `
-    <div style="background:var(--bg2);border:1px solid rgba(255,95,0,.4);border-radius:6px;padding:28px 30px">
-      <div style="color:var(--orange);font-family:var(--mono);font-size:8px;letter-spacing:3px;text-transform:uppercase;margin-bottom:10px">⚠ something exploded (not max's fault)</div>
-      <pre style="font-family:var(--mono);font-size:11px;white-space:pre-wrap;color:var(--text)">${err}</pre>
-      <div style="color:var(--muted);font-family:var(--mono);font-size:9px;margin-top:12px">check the terminal · blame the api · maybe blame perez</div>
-    </div>`;
-}
-
-function render(d) {
-  document.getElementById('last-updated').textContent = 'synced ' + d.last_updated;
-  const c     = d.championship;
-  const preds = d.predictions;
-  const nxt   = preds.find(p => !p.completed);
-  const done  = preds.filter(p => p.completed).length;
-
-  // ── Spotlight
-  const spotlight = nxt ? `
-    <div class="spotlight anim">
-      <div>
-        <div class="sp-label">Next Victim</div>
-        <div class="sp-name">${nxt.name}</div>
-        <div class="sp-meta">Round ${nxt.round} &nbsp;·&nbsp; ${nxt.date} &nbsp;·&nbsp; historical win rate: ${nxt.win_rate_hist}%</div>
-      </div>
-      <div class="sp-divider"></div>
-      <div class="sp-stat">
-        <div class="sp-stat-val">${nxt.win_prob}%</div>
-        <div class="sp-stat-lbl">win prob</div>
-      </div>
-      <div class="sp-stat">
-        <div class="sp-stat-val">${nxt.podium_prob}%</div>
-        <div class="sp-stat-lbl">podium prob</div>
-      </div>
-      <div class="sp-stat">
-        <div class="sp-stat-val">P${nxt.pred_pos}</div>
-        <div class="sp-stat-lbl">predicted</div>
-      </div>
-    </div>` : `
-    <div class="spotlight anim" style="border-left-color:var(--green)">
-      <div><div class="sp-label" style="color:var(--green)">Season Status</div>
-      <div class="sp-name">SEASON COMPLETE</div>
-      <div class="sp-meta">all 24 rounds done · how many did he win?</div></div>
-    </div>`;
-
-  // ── Table rows
-  const rows = preds.map(p => {
-    const isNxt = p === nxt;
-    const posCell = (p.completed && p.actual)
-      ? `<span class="apos">P${p.actual}</span>`
-      : `<span class="ppos" style="color:${posColor(p.pred_pos)}">P${p.pred_pos}</span>`;
-    const stat = p.completed
-      ? `<span class="badge b-done">done ✓</span>`
-      : isNxt
-        ? `<span class="badge b-next">▶ next</span>`
-        : `<span class="badge b-up">upcoming</span>`;
-    return `<tr class="${p.completed?'done':''} ${isNxt?'nxt':''}">
-      <td><span class="rnd">R${p.round}</span></td>
-      <td class="race-nm">${p.name}</td>
-      <td class="dt">${p.date}</td>
-      <td>${posCell}</td>
-      <td>
-        <div class="barrow">
-          <div class="barbg"><div class="barfill" style="width:${Math.min(100,p.win_prob*2)}%;background:var(--orange)"></div></div>
-          <span class="barval" style="color:var(--orange)">${p.win_prob}%</span>
-        </div>
-      </td>
-      <td>
-        <div class="barrow">
-          <div class="barbg"><div class="barfill" style="width:${p.podium_prob}%;background:#ff9030"></div></div>
-          <span class="barval" style="color:#ff9030">${p.podium_prob}%</span>
-        </div>
-      </td>
-      <td class="dt">${p.win_rate_hist}%</td>
-      <td>${stat}</td>
-    </tr>`;
-  }).join('');
-
-  document.getElementById('main').innerHTML = `
-    ${spotlight}
-
-    <div class="champ-grid anim">
-      <div class="cm">
-        <div class="cm-label">projected points</div>
-        <div class="cm-value hi">${c.mean}</div>
-        <div class="cm-sub">full season avg</div>
-      </div>
-      <div class="cm">
-        <div class="cm-label">points banked</div>
-        <div class="cm-value">${c.completed_pts}</div>
-        <div class="cm-sub">${done} race${done!==1?'s':''} done</div>
-      </div>
-      <div class="cm">
-        <div class="cm-label">best case (P90)</div>
-        <div class="cm-value">${c.p90}</div>
-        <div class="cm-sub">top 10% of runs</div>
-      </div>
-      <div class="cm">
-        <div class="cm-label">worst case (P10)</div>
-        <div class="cm-value">${c.p10}</div>
-        <div class="cm-sub">bottom 10% of runs</div>
-      </div>
-      <div class="cm">
-        <div class="cm-label">races left</div>
-        <div class="cm-value">${c.remaining_races}</div>
-        <div class="cm-sub">of 24 total</div>
-      </div>
-    </div>
-
-    <div class="chart-card anim">
-      <div class="card-label">10,000 season simulations &nbsp;·&nbsp; championship points distribution</div>
-      <canvas id="mcChart" height="72"></canvas>
-    </div>
-
-    <div class="races-card anim">
-      <div class="races-header">
-        <div class="card-label" style="margin:0">2026 Race Predictions &nbsp;·&nbsp; all 24 rounds</div>
-        <span style="font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px">${done}/24 COMPLETED</span>
-      </div>
-      <table>
-        <thead><tr>
-          <th>#</th><th>Race</th><th>Date</th><th>Pos</th>
-          <th>Win %</th><th>Podium %</th><th>Hist Win %</th><th>Status</th>
-        </tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>`;
-
-  // Chart
-  if (mcChart) { mcChart.destroy(); mcChart = null; }
-  const ctx = document.getElementById('mcChart').getContext('2d');
-  mcChart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: c.hist_edges.slice(0,-1).map(v => Math.round(v)),
-      datasets: [{
-        data: c.hist,
-        backgroundColor: 'rgba(255,95,0,.6)',
-        borderColor: 'rgba(255,95,0,.85)',
-        borderWidth: 1, borderRadius: 2,
-      }]
-    },
-    options: {
-      plugins: {
-        legend: {display:false},
-        tooltip: {
-          callbacks: { label: ctx => `${ctx.raw} simulations` },
-          bodyFont: {family:'IBM Plex Mono'}, titleFont: {family:'IBM Plex Mono'}
-        }
-      },
-      scales: {
-        x: { ticks:{color:'#445570',font:{family:'IBM Plex Mono',size:9}}, grid:{color:'#1c2840'} },
-        y: { ticks:{color:'#445570',font:{family:'IBM Plex Mono',size:9}}, grid:{color:'#1c2840'} }
-      }
-    }
-  });
-}
-
-window.onload = doRefresh;
-</script>
-</body>
-</html>
-"""
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/")
 def index():
-    return HTML
+    return render_template("index.html")
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
@@ -1037,6 +553,6 @@ def api_refresh():
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("  VER33 F1 Dashboard · http://localhost:5000")
+    print("  MAX 33 Oracle · http://localhost:5000")
     print("="*50 + "\n")
     app.run(debug=False, port=5000)

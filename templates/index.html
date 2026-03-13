@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MAX 33 · 2026 ORACLE</title>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;600&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- Loading overlay -->
+  <div class="overlay" id="overlay">
+    <div class="spinner"></div>
+    <div class="load-msg" id="load-msg">summoning max from the simulator...</div>
+  </div>
+
+  <!-- Header -->
+  <header>
+    <div class="logo-block">
+      <div class="logo-number">33</div>
+      <div class="logo-text">
+        <div class="logo-title">MAX VERSTAPPEN · 2026 ORACLE</div>
+        <div class="logo-tagline">VER5TAPPEN TRUTHER &nbsp;·&nbsp; in my books he is either #1 or #33 i do not acknowledge max3</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="last-updated" id="last-updated">—</div>
+      <div class="live-dot"></div>
+      <button class="refresh-btn" id="ref-btn" onclick="doRefresh()">↺ Refresh</button>
+    </div>
+  </header>
+
+  <!-- Main content — populated by app.js -->
+  <main id="main">
+    <div class="empty-state">
+      hit refresh · the oracle awaits
+    </div>
+  </main>
+
+  <footer>
+    MAX 33 ORACLE &nbsp;·&nbsp; BUILT FOR THE VERSTAPPEN-PILLED &nbsp;·&nbsp; POWERED BY THE COLLECTIVE DESPAIR OF EVERYONE ELSE ON THE GRID
+  </footer>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
