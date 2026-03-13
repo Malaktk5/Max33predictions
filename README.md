@@ -52,7 +52,6 @@ max33-oracle/
 │   └── app.js                 # All frontend JS (refresh, render, chart)
 │
 └── f1_cache/                  # Auto-created — API responses + trained model
-    ├── model.pkl
     ├── data_hash.txt
     └── wx_*.json / *_results.json
 ```
@@ -78,10 +77,9 @@ pandas
 numpy
 scikit-learn
 requests
-gunicorn
 ```
 
-Python 3.9+ recommended. Add `gunicorn` for production deployment.
+Python 3.9+ recommended
 
 ---
 
