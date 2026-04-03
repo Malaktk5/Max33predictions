@@ -1,0 +1,25 @@
+
+ƛ No binary specified, looking for `pyre.bin` in PATH
+ƛ Pyre binary is located at `/home/malak/.local/bin/pyre.bin`
+ƛ Could not determine the number of Pyre workers from configuration. Auto-set the value to 3.
+ƛ No typeshed specified, looking for it...
+ƛ `import typeshed` failed.
+
+ƛ Could not find a suitable typeshed. Types for Python builtins and standard libraries may be missing!
+
+ƛ Writing arguments into /tmp/pyre_arguments_m1sc7laq.json...
+ƛ  Building module tracker...
+ƛ  Collecting all definitions...
+ƛ  Checking 43 functions...
+ƛ  Processed 8 of 43 functions
+ƛ  Processed 16 of 43 functions
+ƛ  Processed 24 of 43 functions
+ƛ  Processed 32 of 43 functions
+ƛ  Processed 35 of 43 functions
+ƛ  Processed 43 of 43 functions
+ƛ  Postprocessing 5 sources...
+ƛ  Postprocessed 2 of 5 sources
+ƛ  Postprocessed 3 of 5 sources
+ƛ  Postprocessed 5 of 5 sources
+ƛ No type errors found
+
