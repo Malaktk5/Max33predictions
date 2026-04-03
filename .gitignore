@@ -1,3 +1,13 @@
+# ── Project-specific ─────────────────────────────────────────
+f1_cache/           # API response cache + trained model pickles
+*.pkl               # Pickle files (model cache)
+fetch_test.py       # Debug scripts
+debug_*.json        # Debug output
+text_final.txt      # Local test output
+pyre_out.txt
+flake8_out.txt
+.pyre_configuration
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

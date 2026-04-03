@@ -223,8 +223,13 @@ def load_cache(key):
     ttl = 900 if key.endswith("_results") or key.endswith("_standings") else 3600 * 24 * 30
     if age > ttl:
         return None
-    with open(p) as f:
-        return json.load(f)
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        # Corrupt/empty cache file — delete it so we re-fetch cleanly
+        p.unlink(missing_ok=True)
+        return None
 
 
 def save_cache(key, data):
@@ -255,6 +260,8 @@ def fetch(endpoint, cache_key=None, retries=3):
                     continue
                 r.raise_for_status()
                 data = r.json()
+                if not data:  # empty body — don't cache, treat as failure
+                    continue
                 if cache_key:
                     save_cache(cache_key, data)
                 return data
